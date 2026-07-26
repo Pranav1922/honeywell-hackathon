@@ -14,4 +14,14 @@ export default defineConfig({
       },
     },
   },
+  // Tests live beside the modules they cover. jsdom rather than a browser: the
+  // assertions that matter are on the exported data-shaping functions and on
+  // rendered text, neither of which needs a real layout engine.
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./src/test/setup.js'],
+    include: ['src/**/*.test.{js,jsx}'],
+    restoreMocks: true,
+  },
 })
