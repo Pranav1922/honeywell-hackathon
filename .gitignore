@@ -1,0 +1,38 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# secrets and local config
+.env
+
+# data produced by runs
+*.db
+*.db-wal
+*.db-shm
+backend/models/generated/*
+!backend/models/generated/README.md
+
+# EnergyPlus run output
+*.err
+*.eso
+*.mtr
+*.rdd
+*.mdd
+*.audit
+*.bnd
+*.eio
+*.shd
+*.sql
+eplusout.*
+eplusssz.*
+epluszsz.*
+
+# node
+node_modules/
+dist/
+
+# os
+.DS_Store

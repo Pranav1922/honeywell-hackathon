@@ -1,0 +1,20 @@
+# Eco-Loop Building Agents — backend dependencies
+#
+# pyenergyplus is deliberately absent: it is not a PyPI package. It ships inside
+# the EnergyPlus installation and is placed on sys.path at import time using
+# ENERGYPLUS_DIR from .env. See docs/ARCHITECTURE.md §12.
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.8
+numpy>=1.26
+httpx>=0.27
+openai>=1.40          # OpenAI-compatible transport; points at Ollama by default
+sse-starlette>=2.1    # Server-Sent Events for the live dashboard stream
+python-dotenv>=1.0
+
+# Milestone 4
+mcp>=1.0              # MCP server wrapping the agent's tool registry
+
+# development
+pytest>=8.3
