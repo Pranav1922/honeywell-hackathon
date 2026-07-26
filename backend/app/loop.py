@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import sqlite3
 from collections import deque
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Callable, Sequence
 
@@ -26,7 +27,7 @@ from app.agents.llm import LLMSupervisor
 from app.agents.rule import BaselineScheduler, ReactiveGuard
 from app.agents.tools import AgentContext, ToolRegistry
 from app.comfort import clothing_for_season, is_comfortable, ppd, pmv
-from app.config import Scenario, Settings
+from app.config import Scenario, Settings, load_settings
 from app.energy import RunSummary, step_energy_kwh, summarise
 from app.sim.base import BuildingState, Simulator
 from app.sim.toy import ToySimulator
@@ -35,7 +36,7 @@ from app.sim.weather import SyntheticWeather
 COMMIT_INTERVAL_STEPS = 200
 
 CONTROLLERS = ("baseline", "rule", "llm")
-SIMULATORS = ("toy",)
+SIMULATORS = ("toy", "energyplus")
 
 
 class ClosedLoopRunner:
@@ -89,6 +90,7 @@ class ClosedLoopRunner:
             state = self._simulator.reset()
             self._history.clear()
             self._history.append(state)
+            self._attach_diagnostics()
 
             for _ in range(self._simulator.horizon_steps):
                 if self._stopped:
@@ -129,6 +131,10 @@ class ClosedLoopRunner:
 
                 if state.step % COMMIT_INTERVAL_STEPS == 0:
                     conn.commit()
+                    # Re-read the simulator's diagnostics so the agent's
+                    # get_simulation_errors tool reports faults raised during the
+                    # run, not only those present when it started.
+                    self._attach_diagnostics()
 
             conn.commit()
             summary = summarise(
@@ -175,6 +181,28 @@ class ClosedLoopRunner:
         return tuple(self._history)
 
     # -- internals ----------------------------------------------------------
+
+    def _attach_diagnostics(self) -> None:
+        """Feed the simulator's runtime errors to the agent's tool context.
+
+        This is what makes `get_simulation_errors` real rather than always empty:
+        the EnergyPlus `.err` file is read once the run has started and handed to
+        the same context the model queries, so the agent can react to a runtime
+        problem without anybody editing code. Both sides are optional — a toy run
+        has no `.err`, and the baseline controller has no context — so this is a
+        no-op unless an LLM run is driving EnergyPlus.
+        """
+        collect = getattr(self._simulator, "collect_errors", None)
+        tools = getattr(self._controller, "_tools", None)
+        if collect is None or tools is None:
+            return
+        # Replaced rather than appended: EnergyPlus writes the .err file
+        # progressively, so each read returns a superset of the last one and
+        # appending would inflate every occurrence count.
+        context = tools.context
+        context.error_log.clear()
+        for line in collect():
+            context.record_error(line)
 
     def _evaluate_comfort(self, state: BuildingState) -> _ComfortValue:
         """PMV, PPD and the comfort verdict for one state.
@@ -248,16 +276,26 @@ def settings_for_scenario(settings: Settings, scenario: Scenario) -> Settings:
 
 
 def build_simulator(
-    scenario: Scenario, simulator: str = "toy", horizon_steps: int | None = None
+    scenario: Scenario,
+    simulator: str = "toy",
+    horizon_steps: int | None = None,
+    settings: Settings | None = None,
 ) -> Simulator:
     """Construct the simulator a scenario calls for.
 
-    Milestone 1 ships the toy simulator only; `EnergyPlusSimulator` joins the
-    same branch in Milestone 4 without any other module changing.
+    Both implementations satisfy the same protocol, so nothing downstream — the
+    runner, the controllers, the persistence layer, the dashboard — can tell them
+    apart. `settings` is only needed for the EnergyPlus install path and is
+    optional so every existing caller keeps working unchanged.
     """
     if simulator not in SIMULATORS:
         raise ValueError(
             f"unknown simulator {simulator!r}; available: {', '.join(SIMULATORS)}"
+        )
+
+    if simulator == "energyplus":
+        return _build_energyplus(
+            scenario, horizon_steps or scenario.horizon_steps, settings or load_settings()
         )
 
     weather = SyntheticWeather(
@@ -283,7 +321,7 @@ def build_controller(
     if controller == "baseline":
         return BaselineScheduler(occupied_hours=scenario.occupied_hours)
     if controller == "rule":
-        return ReactiveGuard(**_guard_limits(settings), occupied_hours=scenario.occupied_hours)
+        return ReactiveGuard(**guard_limits(settings), occupied_hours=scenario.occupied_hours)
     if controller == "llm":
         return _build_supervisor(scenario, settings)
     raise ValueError(
@@ -291,7 +329,54 @@ def build_controller(
     )
 
 
-def _guard_limits(settings: Settings) -> dict[str, float]:
+def _build_energyplus(
+    scenario: Scenario, horizon_steps: int, settings: Settings
+) -> Simulator:
+    """Construct an `EnergyPlusSimulator` from the scenario's `energyplus` block.
+
+    Output goes to a per-run directory under `generated_idf_dir` so concurrent
+    runs cannot overwrite each other's `.err` file — which the agent reads through
+    `get_simulation_errors`, so a shared one would attribute another run's faults
+    to this one.
+    """
+    from app.sim.energyplus import EnergyPlusSimulator, write_dated_variant
+
+    config = scenario.energyplus or {}
+    idf_path = _resolve_model_path(config.get("idf"), settings, "idf")
+    epw_path = _resolve_model_path(config.get("epw"), settings, "epw")
+    output_dir = settings.generated_idf_dir / f"{scenario.id}-{horizon_steps}"
+
+    # EnergyPlus takes its calendar from the .idf, not from the scenario, so the
+    # baseline model is re-dated to the scenario's own window and the variant that
+    # actually runs is kept alongside the run's output.
+    days = max(1, -(-horizon_steps * scenario.timestep_seconds // 86400))
+    generated_idf = write_dated_variant(idf_path, output_dir, scenario.start, days)
+
+    return EnergyPlusSimulator(
+        idf_path=generated_idf,
+        epw_path=epw_path,
+        output_dir=output_dir,
+        energyplus_dir=settings.energyplus_dir,
+        horizon_steps=horizon_steps,
+        timestep_seconds=scenario.timestep_seconds,
+        calendar_year=scenario.start.year,
+    )
+
+
+def _resolve_model_path(value, settings: Settings, kind: str):
+    """Resolve a scenario's model path relative to the models directory."""
+    if not value:
+        raise ValueError(
+            f"scenario does not declare an {kind} file; add "
+            f'"energyplus": {{"{kind}": "baseline/..."}} to the scenario JSON'
+        )
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path
+    return (settings.baseline_idf_dir.parent / path).resolve()
+
+
+def guard_limits(settings: Settings) -> dict[str, float]:
     """The hard limits the guard enforces, as one dict.
 
     Stated explicitly rather than left to `ReactiveGuard`'s defaults so this dict
@@ -315,7 +400,7 @@ def _guard_limits(settings: Settings) -> dict[str, float]:
 
 def _build_supervisor(scenario: Scenario, settings: Settings) -> Controller:
     """Assemble the two-tier LLM controller: supervisor over guard over fallback."""
-    limits = _guard_limits(settings)
+    limits = guard_limits(settings)
     guard = ReactiveGuard(**limits, occupied_hours=scenario.occupied_hours)
 
     context = AgentContext(

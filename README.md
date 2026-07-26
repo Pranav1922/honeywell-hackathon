@@ -22,12 +22,12 @@ Architecture is frozen and scaffolded; implementation proceeds by milestone.
 
 | Milestone | Contents | State |
 |---|---|---|
-| **M1** | Toy simulator, baseline + guard controllers, PMV comfort, energy accounting, SQLite, FastAPI, CLI | Not started |
-| **M2** | LLM supervisor, tool registry, prompts, log compaction | Not started |
+| **M1** | Toy simulator, baseline + guard controllers, PMV comfort, energy accounting, SQLite, FastAPI, CLI | Complete |
+| **M2** | LLM supervisor, tool registry, prompts, log compaction | Complete |
 | **M3** | React dashboard | Not started |
 | **M4** | EnergyPlus integration, MCP server, baseline `.idf` | Not started |
 
-M1–M3 have no dependency on EnergyPlus or Ollama being installed. Only M4 does.
+M1 needs nothing external. M2 needs a Groq API key. Only M4 needs EnergyPlus.
 
 ## Design in one paragraph
 
@@ -65,7 +65,9 @@ pip install -r requirements.txt
 
 ```bash
 cd backend
-python cli.py --scenario summer_week --controller baseline   # headless
+python cli.py --scenario summer_week --controller baseline   # fixed schedule
+python cli.py --scenario summer_week --controller rule    --compare 1
+python cli.py --scenario summer_week --controller llm     --compare 1   # the agent
 uvicorn app.main:app --reload                                # API on :8000
 python -m pytest                                             # tests
 ```
@@ -80,14 +82,18 @@ npm run dev                                                  # :5173
 
 ### Open-source LLM (Milestone 2)
 
+The supervisor runs an open-source model — Llama 3.3 70B by default — served by
+Groq. Get a key at [console.groq.com/keys](https://console.groq.com/keys) and put
+it in `.env`:
+
 ```bash
-brew install ollama && ollama serve
-ollama pull qwen2.5:7b-instruct
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=llama-3.3-70b-versatile
 ```
 
-Ollama exposes an OpenAI-compatible endpoint, so any other self-hosted
-OpenAI-compatible server works by changing `LLM_BASE_URL` in `.env` — no code
-change.
+The key is read from the environment only and is never committed. Switching model
+is a `.env` change, not a code change; `--controller=baseline` and
+`--controller=rule` need no key at all.
 
 ### EnergyPlus (Milestone 4)
 
