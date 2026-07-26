@@ -21,7 +21,10 @@ from typing import Callable, Sequence
 
 from app import db
 from app.agents.base import Controller
+from app.agents.client import LLMClient
+from app.agents.llm import LLMSupervisor
 from app.agents.rule import BaselineScheduler, ReactiveGuard
+from app.agents.tools import AgentContext, ToolRegistry
 from app.comfort import clothing_for_season, is_comfortable, ppd, pmv
 from app.config import Scenario, Settings
 from app.energy import RunSummary, step_energy_kwh, summarise
@@ -31,7 +34,7 @@ from app.sim.weather import SyntheticWeather
 
 COMMIT_INTERVAL_STEPS = 200
 
-CONTROLLERS = ("baseline", "rule")
+CONTROLLERS = ("baseline", "rule", "llm")
 SIMULATORS = ("toy",)
 
 
@@ -280,15 +283,66 @@ def build_controller(
     if controller == "baseline":
         return BaselineScheduler(occupied_hours=scenario.occupied_hours)
     if controller == "rule":
-        return ReactiveGuard(
-            min_zone_temp_c=settings.min_zone_temp_c,
-            max_zone_temp_c=settings.max_zone_temp_c,
-            comfort_pmv_low=settings.comfort_pmv_low,
-            comfort_pmv_high=settings.comfort_pmv_high,
-            occupied_hours=scenario.occupied_hours,
-        )
+        return ReactiveGuard(**_guard_limits(settings), occupied_hours=scenario.occupied_hours)
+    if controller == "llm":
+        return _build_supervisor(scenario, settings)
     raise ValueError(
         f"unknown controller {controller!r}; available: {', '.join(CONTROLLERS)}"
+    )
+
+
+def _guard_limits(settings: Settings) -> dict[str, float]:
+    """The hard limits the guard enforces, as one dict.
+
+    Stated explicitly rather than left to `ReactiveGuard`'s defaults so this dict
+    can be passed both to the guard and to the agent's tool context. The limits
+    the model is shown are then by construction the limits it is held to; two
+    copies of these numbers in two modules is exactly how those drift apart.
+    """
+    return {
+        "min_zone_temp_c": settings.min_zone_temp_c,
+        "max_zone_temp_c": settings.max_zone_temp_c,
+        "comfort_pmv_low": settings.comfort_pmv_low,
+        "comfort_pmv_high": settings.comfort_pmv_high,
+        "min_setpoint_gap_c": 1.5,
+        "min_ventilation_ach": 0.5,
+        "max_ventilation_ach": 6.0,
+        "max_co2_ppm": 1000.0,
+        "unoccupied_min_temp_c": 12.0,
+        "unoccupied_max_temp_c": 32.0,
+    }
+
+
+def _build_supervisor(scenario: Scenario, settings: Settings) -> Controller:
+    """Assemble the two-tier LLM controller: supervisor over guard over fallback."""
+    limits = _guard_limits(settings)
+    guard = ReactiveGuard(**limits, occupied_hours=scenario.occupied_hours)
+
+    context = AgentContext(
+        timestep_seconds=scenario.timestep_seconds,
+        limits=limits,
+        targets={
+            "tariff_per_kwh": scenario.targets.tariff_per_kwh,
+            "grid_carbon_kg_per_kwh": scenario.targets.grid_carbon_kg_per_kwh,
+            "peak_demand_kw": scenario.targets.peak_demand_kw,
+        },
+        occupied_hours=scenario.occupied_hours,
+        history_window_steps=settings.history_window_steps,
+    )
+
+    return LLMSupervisor(
+        client=LLMClient(
+            model=settings.llm_model,
+            api_key=settings.llm_api_key or None,
+            timeout_seconds=settings.llm_timeout_seconds,
+            temperature=settings.llm_temperature,
+        ),
+        tools=ToolRegistry(context),
+        guard=guard,
+        fallback=BaselineScheduler(occupied_hours=scenario.occupied_hours),
+        cadence_steps=settings.decision_cadence_steps,
+        max_tool_iterations=settings.max_tool_iterations,
+        max_retries=settings.max_retries,
     )
 
 

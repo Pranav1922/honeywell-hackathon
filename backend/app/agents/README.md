@@ -35,6 +35,8 @@ because a model misbehaved, and the flag keeps the reported results honest.
 
 ## Model independence
 
-Ollama serves an OpenAI-compatible endpoint, so one client covers local
-open-source models and any self-hosted OpenAI-compatible server. Switching model
-or endpoint is a change to `.env`, not to code.
+Groq serves open-source models (Llama, Qwen, GPT-OSS, Kimi) behind an
+OpenAI-shaped chat-completions API with native tool calling, so one client covers
+the whole catalogue. Switching model is a change to `.env`, not to code, and
+`GROQ_API_KEY` is read from the environment only — a missing key fails fast with
+an actionable message rather than starting a run that silently degrades.
