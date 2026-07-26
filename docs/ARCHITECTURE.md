@@ -2,7 +2,7 @@
 
 **Honeywell Hackathon · Question 1 · Autonomous Closed-Loop Building Control**
 
-Status: architecture frozen, implementation pending (Milestone 1 not yet started).
+Status: architecture frozen. Milestones 1 and 2 are implemented; M3 and M4 pending.
 Every module named here exists as a declared contract in the repository; bodies are
 implemented milestone by milestone.
 
@@ -29,9 +29,11 @@ if the demonstration machine cannot host EnergyPlus.
 
 **2. Control is two-tier.** EnergyPlus executes an entire simulation inside a single
 blocking call, and control callbacks fire *on the simulation thread*. Anything slow in
-that callback stalls the simulation. A 7B-parameter local LLM takes seconds to respond;
-an annual run at 15-minute steps has 35,040 timesteps. Calling the LLM every timestep is
-therefore not merely slow, it is architecturally impossible. Instead:
+that callback stalls the simulation. A supervisory call — prompt assembly, a hosted
+inference request, one or more tool round trips — costs hundreds of milliseconds at best
+and a full timeout at worst; an annual run at 15-minute steps has 35,040 timesteps.
+Calling the LLM every timestep is therefore not merely slow, it is architecturally
+impossible. Instead:
 
 | Tier | Runs | Latency budget | Responsibility |
 |---|---|---|---|
@@ -80,8 +82,8 @@ pure reader of that store, which means the demonstration can be replayed offline
                              │                              │
               ┌──────────────▼───────────────┐   ┌──────────▼────────────┐
               │       COGNITIVE LAYER        │   │      API LAYER        │
-              │  LLMClient (OpenAI-compat)   │   │   FastAPI  main.py    │
-              │    → Ollama / qwen2.5:7b     │   │   REST + SSE          │
+              │  LLMClient (Groq SDK)        │   │   FastAPI  main.py    │
+              │    → Groq / llama-3.3-70b    │   │   REST + SSE          │
               │  ToolRegistry ── MCP server  │   └──────────┬────────────┘
               │  prompts.py, logsummary.py   │              │
               └──────────────────────────────┘   ┌──────────▼────────────┐
@@ -127,7 +129,7 @@ pure reader of that store, which means the demonstration can be replayed offline
 │  app/sim/          app/agents/        app/comfort.py    app/energy.py│       │
 │   base.py           base.py            PMV / PPD         kWh, cost,  │       │
 │   toy.py            rule.py                              CO₂, savings│       │
-│   energyplus.py     llm.py ──► client.py ──► Ollama /v1              │       │
+│   energyplus.py     llm.py ──► client.py ──► Groq API                │       │
 │   weather.py        tools.py ◄── mcp_server.py                       │       │
 │                     prompts.py                                       │       │
 │                                                                      ▼       │
@@ -140,7 +142,7 @@ pure reader of that store, which means the demonstration can be replayed offline
                                      │
 ┌────────────────────────────────────▼────────────────────────────────────────┐
 │                             EXTERNAL RUNTIMES                               │
-│   EnergyPlus (pyenergyplus API)   ·   Ollama (qwen2.5:7b, OpenAI-compatible)│
+│   EnergyPlus (pyenergyplus API)   ·   Groq (llama-3.3-70b, tool-calling)    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -252,7 +254,7 @@ honeywell/
 | `base.py` | `Controller` Protocol (`decide(state, history) -> Decision`), the `ControlPolicy` the supervisor emits, and the `Decision` record carrying action, rationale, tool calls and latency. |
 | `rule.py` | Two deterministic controllers. `BaselineScheduler` reproduces conventional fixed-schedule BMS behaviour — the experimental control arm. `ReactiveGuard` is the fast tier: it applies the active policy and clamps every action to hard comfort and equipment limits. |
 | `llm.py` | The supervisory agent. Assembles observations, invokes the model with tools, parses the returned policy, validates it, retries on malformed output, and falls back to `BaselineScheduler` when the model is unavailable. Owns the decision cadence. |
-| `client.py` | The only code that talks to a model. One OpenAI-compatible implementation covering Ollama and any self-hosted OpenAI-compatible endpoint, differing only by `base_url`. Handles timeouts, retries and token accounting. |
+| `client.py` | The only code that talks to a model. One implementation over the official Groq SDK, covering every model in the Groq catalogue by name alone. Configuration is entirely environmental; handles timeouts, retries and token accounting. |
 | `tools.py` | The tool registry: JSON-schema'd functions the LLM may call (query telemetry history, evaluate a candidate policy, read comfort limits, inspect simulation errors). Single source of truth, shared with `mcp_server.py`. |
 | `prompts.py` | System prompt, observation rendering, and tool-result formatting. Isolated so prompt engineering is reviewable as a diff. |
 
@@ -695,8 +697,8 @@ User    Dashboard   FastAPI    ClosedLoopRunner   Controller    LLMClient   Simu
 | Simulation engine | **EnergyPlus** via `pyenergyplus` runtime API | Mandated. The runtime API is the only route that injects set-points into a *live* instance; `eppy` edit-and-rerun is batch optimisation and does not satisfy the requirement. |
 | EnergyPlus binding | Install-bundled `pyenergyplus` on `sys.path` | `pyenergyplus` is not a PyPI package — it ships inside the EnergyPlus installation. `config.py` carries the install path. |
 | Development simulator | **Custom RC thermal network** (NumPy) | Lets the loop, agent, persistence and dashboard be built and stress-tested before EnergyPlus exists, and serves as a live demo fallback. Two real implementations justify the Protocol. |
-| LLM | **Ollama + `qwen2.5:7b-instruct`** | Genuinely open-source as required, reliable tool-calling, runs on a laptop, no API key or network dependency on demo day. |
-| LLM transport | **One OpenAI-compatible client** (`openai` package) | Ollama exposes an OpenAI-compatible endpoint at `/v1`. One client with a configurable `base_url` covers local OSS models *and* any self-hosted endpoint. Model-agnostic by construction — no adapter hierarchy. |
+| LLM | **Groq + `llama-3.3-70b-versatile`** | Genuinely open-source weights as required, with reliable native tool-calling. Hosted inference removes the 7B-on-a-laptop quality ceiling and the local-GPU dependency on demo day, and is fast enough that a supervisory call costs well under a second. |
+| LLM transport | **Official Groq SDK** (`groq` package) | One client, one endpoint, model selected by name. Every model in the catalogue speaks the same chat-completions and tool-calling shape, so switching model is a `.env` change — model-agnostic by construction, no adapter hierarchy. |
 | Web framework | **FastAPI** | Already installed; async background tasks and SSE are first-class; Pydantic gives the API contract for free. |
 | Persistence | **SQLite via stdlib `sqlite3`** | ~35k rows per annual run — trivial for SQLite. No server, no ORM, no migrations, and the whole evidence base is one committable file. |
 | Frontend | **Vite + React + Recharts** | Fastest path to a live-updating multi-panel dashboard; Recharts covers every chart needed without a bespoke D3 layer. |
@@ -715,9 +717,10 @@ layer be finished and validated before EnergyPlus is installed, and it de-risks 
 demonstration. Two genuine implementations are what justify the abstraction.
 
 **D2 — Two-tier control.** The LLM cannot be in the per-timestep path: EnergyPlus callbacks
-run on the simulation thread, and a 7B model takes seconds while an annual run has 35,040
-timesteps. Splitting policy (slow, LLM) from enforcement (fast, deterministic) is what
-makes an extended horizon feasible at all — the criterion carrying the most weight.
+run on the simulation thread, and a supervisory call takes hundreds of milliseconds to
+seconds while an annual run has 35,040 timesteps. Splitting policy (slow, LLM) from
+enforcement (fast, deterministic) is what makes an extended horizon feasible at all — the
+criterion carrying the most weight.
 
 **D3 — The guard can override the LLM.** Hard comfort and equipment limits are enforced in
 code, not requested in a prompt. A hallucinated set-point cannot harm occupants or the
@@ -767,7 +770,7 @@ calls in-process and the tools an external MCP client calls are the same functio
 |---|---|
 | Utilise EnergyPlus for high-fidelity simulation | `sim/energyplus.py` drives a real `.idf` through the EnergyPlus runtime API; baseline model in `models/baseline/`. |
 | Use functional libraries (eppy / PyEnergyPlus / EMS / BCVTB) to bridge Python and the `.idf` | `pyenergyplus` runtime API — sensor reads via `api.exchange.get_variable_value`, actuator writes via `set_actuator_value`. |
-| Deploy a modern open-source LLM, locally or self-hosted | Ollama serving `qwen2.5:7b-instruct` locally; `agents/client.py` is endpoint-agnostic, so any self-hosted OpenAI-compatible server also works. |
+| Deploy a modern open-source LLM, locally or self-hosted | `llama-3.3-70b-versatile` — open weights — served by Groq through `agents/client.py`. The model is named in `.env`, so any other open-source model in the catalogue is a configuration change. |
 | Implement an MCP server or custom agentic tools | `agents/tools.py` is the custom tool registry; `mcp_server.py` exposes the identical registry over MCP. |
 | The LLM must use tools to parse files, extract runtime errors, and execute tasks without human code modification | Tools include telemetry queries, comfort-limit lookup, policy evaluation, and `get_simulation_errors`, which surfaces parsed EnergyPlus `.err` output so the agent can react to runtime problems autonomously. |
 | **Feedback** — stream continuous performance metrics (zone temperatures, IAQ, energy, PMV) | `BuildingState` carries zone temperature, outdoor temperature, occupancy, CO₂ (IAQ), and power every timestep; `comfort.py` derives PMV/PPD; all persisted and streamed over SSE. |
@@ -803,9 +806,9 @@ calls in-process and the tools an external MCP client calls are the same functio
 | Milestone | Contents | Demonstrable outcome |
 |---|---|---|
 | **M1** | `sim/base.py`, `sim/toy.py`, `sim/weather.py`, `agents/base.py`, `agents/rule.py`, `comfort.py`, `energy.py`, `db.py`, `loop.py`, `main.py`, `cli.py`, tests | `python backend/cli.py` runs baseline and rule controllers over one week and prints kWh saved and comfort violations. A working closed loop with quantified savings. |
-| **M2** | `agents/client.py`, `agents/tools.py`, `agents/prompts.py`, `agents/llm.py`, `utils/logsummary.py` | Same command with `--controller=llm`: local OSS model drives the building, with readable rationales and measured savings. |
+| **M2** | `agents/client.py`, `agents/tools.py`, `agents/prompts.py`, `agents/llm.py`, `utils/logsummary.py` | Same command with `--controller=llm`: an open-source model drives the building, with readable rationales and measured savings. |
 | **M3** | `frontend/` — all components, hooks, API client | Live dashboard: temperature, energy, occupancy, comfort, current action, cumulative savings, streaming AI explanations. |
 | **M4** | `sim/energyplus.py`, `mcp_server.py`, `models/baseline/`, EnergyPlus install | The identical loop, agent and dashboard running against real EnergyPlus, plus MCP exposure. |
 
-Milestones M1–M3 have no dependency on EnergyPlus or Ollama being installed. M4 requires
-both.
+Milestone M1 has no external dependency at all. M2 and M3 need only a `GROQ_API_KEY`;
+M4 is the only milestone that requires an EnergyPlus installation.

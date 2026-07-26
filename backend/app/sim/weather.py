@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -125,10 +125,118 @@ class SyntheticWeather:
 
 
 class EpwWeather:
-    """Reads real hourly weather from an EnergyPlus `.epw` file."""
+    """Reads real hourly weather from an EnergyPlus `.epw` file.
 
-    def __init__(self, epw_path: Path, timestep_seconds: int = 900) -> None:
-        raise NotImplementedError("Milestone 4")
+    An `.epw` is 8,760 hourly records after an eight-line header. A simulation
+    timestep is finer than that, so sub-hourly steps are linearly interpolated
+    between the bracketing hours — a step change on the hour would put a
+    discontinuity into the zone heat balance that the real climate does not have.
+
+    Occupancy is not in the weather file, so the same weekday schedule
+    `SyntheticWeather` uses is applied. That keeps the two providers
+    interchangeable and keeps a baseline and agent run on identical occupancy.
+    """
+
+    HEADER_LINES = 8
+    DRY_BULB_FIELD = 6
+    GLOBAL_HORIZONTAL_FIELD = 13
+    HOURS_PER_YEAR = 8760
+
+    def __init__(
+        self,
+        epw_path: Path,
+        timestep_seconds: int = 900,
+        start: datetime | None = None,
+        occupied_hours: tuple[int, int] = (8, 18),
+    ) -> None:
+        """Parse the weather file once, up front.
+
+        Args:
+            epw_path: Path to the `.epw` file.
+            timestep_seconds: Simulation timestep.
+            start: Simulated wall-clock at step 0. Defaults to the first record
+                in the file.
+            occupied_hours: Half-open [start_hour, end_hour) occupied window.
+        """
+        path = Path(epw_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"epw file not found: {path}")
+
+        records = self._parse(path)
+        if not records:
+            raise ValueError(f"{path.name} contains no hourly weather records")
+
+        self._temps_c = [record[0] for record in records]
+        self._solar_w_m2 = [record[1] for record in records]
+        self._timestep_seconds = timestep_seconds
+        self._occupied_hours = occupied_hours
+        self._start = start if start is not None else records[0][2]
 
     def sample(self, step: int) -> WeatherSample:
-        raise NotImplementedError("Milestone 4")
+        """Conditions at `step`, interpolated between hourly records."""
+        if step < 0:
+            raise ValueError(f"step must be non-negative, got {step}")
+
+        sim_time = step_to_time(self._start, step, self._timestep_seconds)
+        elapsed_hours = step * self._timestep_seconds / 3600.0
+        index = int(elapsed_hours) % len(self._temps_c)
+        next_index = (index + 1) % len(self._temps_c)
+        blend = elapsed_hours - int(elapsed_hours)
+
+        return WeatherSample(
+            sim_time=sim_time,
+            outdoor_temp_c=_lerp(self._temps_c[index], self._temps_c[next_index], blend),
+            solar_w_m2=_lerp(
+                self._solar_w_m2[index], self._solar_w_m2[next_index], blend
+            ),
+            occupancy=self._occupancy(sim_time, hour_of_day(sim_time)),
+        )
+
+    def _occupancy(self, sim_time: datetime, hour: float) -> float:
+        """The same trapezoidal weekday profile the synthetic provider uses."""
+        if is_weekend(sim_time):
+            return 0.0
+        start_hour, end_hour = self._occupied_hours
+        if not start_hour <= hour < end_hour:
+            return 0.0
+        if hour < start_hour + 1.0 or hour >= end_hour - 1.0:
+            return RAMP_OCCUPANCY
+        return 1.0
+
+    @classmethod
+    def _parse(cls, path: Path) -> list[tuple[float, float, datetime]]:
+        """Extract (dry-bulb, global horizontal solar, timestamp) per hour.
+
+        Malformed lines are skipped rather than fatal. Real weather files carry
+        occasional bad rows, and losing one hour out of 8,760 is not a reason to
+        abandon a run.
+        """
+        records: list[tuple[float, float, datetime]] = []
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle):
+                if line_number < cls.HEADER_LINES:
+                    continue
+                fields = line.strip().split(",")
+                if len(fields) <= cls.GLOBAL_HORIZONTAL_FIELD:
+                    continue
+                try:
+                    # EPW hours run 1-24; hour 24 is midnight ending that day.
+                    hour = int(fields[3])
+                    timestamp = datetime(
+                        int(fields[0]), int(fields[1]), int(fields[2])
+                    ) + timedelta(hours=hour - 1)
+                    records.append(
+                        (
+                            float(fields[cls.DRY_BULB_FIELD]),
+                            max(0.0, float(fields[cls.GLOBAL_HORIZONTAL_FIELD])),
+                            timestamp,
+                        )
+                    )
+                except (ValueError, IndexError):
+                    continue
+        return records
+
+
+def _lerp(low: float, high: float, blend: float) -> float:
+    """Linear interpolation between two hourly records."""
+    return low + (high - low) * blend

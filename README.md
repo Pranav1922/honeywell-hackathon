@@ -65,6 +65,7 @@ model never stalls the run.
 
 | | Feature | What it means |
 |---|---|---|
+
 | ✅ | **EnergyPlus integration** | Driven through the `pyenergyplus` runtime API — sensors read and actuators written *inside* the running simulation |
 | ✅ | **AI-powered control** | Open-weight Llama 3.3 70B (via Groq) with native tool-calling emits a validated `ControlPolicy` |
 | ✅ | **Reactive safety layer** | A deterministic guard clamps every action to hard comfort/equipment limits, every timestep |
@@ -77,6 +78,9 @@ model never stalls the run.
 | ✅ | **392 automated tests** | 161 backend (pytest) + 231 frontend (vitest) |
 
 ---
+
+
+
 
 ## 🏗 Architecture
 
@@ -300,7 +304,16 @@ pip install -r requirements.txt
 ### 3. Environment file
 
 ```bash
+<<<<<<< HEAD
 cp .env.example .env        # Windows: copy .env.example .env
+=======
+cd backend
+python cli.py --scenario summer_week --controller baseline   # fixed schedule
+python cli.py --scenario summer_week --controller rule    --compare 1
+python cli.py --scenario summer_week --controller llm     --compare 1   # the agent
+uvicorn app.main:app --reload                                # API on :8000
+python -m pytest                                             # tests
+>>>>>>> 2f9126c (Complete Milestone 4: EnergyPlus integration)
 ```
 
 Then edit `.env` — see [Environment Variables](#-environment-variables). Every
@@ -322,11 +335,25 @@ The file lands at `DATABASE_PATH`, `backend/ecoloop.db` by default.
 
 To start from an empty store, just delete it:
 
+The supervisor runs an open-source model — Llama 3.3 70B by default — served by
+Groq. Get a key at [console.groq.com/keys](https://console.groq.com/keys) and put
+it in `.env`:
+
 ```bash
+<<<<<<< HEAD
 rm -f backend/ecoloop.db backend/ecoloop.db-wal backend/ecoloop.db-shm
 ```
 
 ### 6. Groq API key — optional, for `--controller llm`
+=======
+GROQ_API_KEY=gsk_...
+GROQ_MODEL=llama-3.3-70b-versatile
+```
+
+The key is read from the environment only and is never committed. Switching model
+is a `.env` change, not a code change; `--controller=baseline` and
+`--controller=rule` need no key at all.
+>>>>>>> 2f9126c (Complete Milestone 4: EnergyPlus integration)
 
 1. Create a free key at **<https://console.groq.com/keys>**
 2. Put it in `.env`:

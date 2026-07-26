@@ -13,6 +13,7 @@ import json
 import socket
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 from urllib.parse import urlparse
@@ -41,14 +42,52 @@ from app.schemas import (
 )
 from app.utils.timeutil import steps_for_days
 
-app = FastAPI(title="Eco-Loop Building Agents", version="0.1.0")
-
 SETTINGS = load_settings()
 STREAM_POLL_SECONDS = 0.5
 STREAM_IDLE_TIMEOUT_SECONDS = 30.0
 
 _runners: dict[int, ClosedLoopRunner] = {}
 _runners_lock = threading.Lock()
+
+ORPHAN_ERROR = "interrupted: the server process that owned this run exited"
+
+
+def _reconcile_orphaned_runs() -> None:
+    """Fail any run left `running` by a previous process.
+
+    Runs execute in-process on a background thread and `_runners` is in-memory, so
+    a row still marked `running` at startup cannot have an owner — whatever was
+    executing it died with the process that created it.
+
+    Left alone such a row is permanent, and it wedges the whole dashboard: `/stop`
+    answers 404 because there is no runner to cancel, the run never reaches a
+    terminal status, and the UI disables Start while the selected run looks live.
+    One orphan is enough to make the application appear frozen with no error
+    anywhere. Reconciling at startup is what makes a restart a recovery.
+    """
+    conn = db.connect(SETTINGS.database_path)
+    try:
+        orphans = [
+            row["id"] for row in db.list_runs(conn, limit=1000)
+            if row["status"] == "running"
+        ]
+        for run_id in orphans:
+            db.finish_run(conn, run_id, status="failed", error=ORPHAN_ERROR,
+                          finished_at=_now())
+    finally:
+        conn.close()
+    if orphans:
+        print(f"reconciled {len(orphans)} interrupted run(s): {orphans}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Reconcile interrupted runs before serving the first request."""
+    _reconcile_orphaned_runs()
+    yield
+
+
+app = FastAPI(title="Eco-Loop Building Agents", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/api/health", response_model=HealthResponse)
@@ -141,12 +180,34 @@ def start_run(request: StartRunRequest) -> RunResponse:
     finally:
         conn.close()
 
-    runner = ClosedLoopRunner(
-        run_id=run_id,
-        simulator=build_simulator(scenario, request.simulator, horizon_steps),
-        controller=build_controller(request.controller, scenario, settings),
-        settings=settings,
-    )
+    # Constructing the simulator or controller can fail on configuration rather
+    # than on a bug — no EnergyPlus install, a missing .epw, no GROQ_API_KEY. The
+    # run row already exists at that point, so it has to be marked failed here or
+    # it would sit at 'running' forever and the dashboard would poll it forever.
+    try:
+        runner = ClosedLoopRunner(
+            run_id=run_id,
+            simulator=build_simulator(
+                scenario, request.simulator, horizon_steps, settings
+            ),
+            controller=build_controller(request.controller, scenario, settings),
+            settings=settings,
+        )
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        conn = db.connect(settings.database_path)
+        try:
+            db.finish_run(
+                conn,
+                run_id,
+                status="failed",
+                error=detail,
+                finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            )
+        finally:
+            conn.close()
+        raise HTTPException(status_code=400, detail=detail) from exc
+
     with _runners_lock:
         _runners[run_id] = runner
 
@@ -192,9 +253,28 @@ def stop_run(run_id: int) -> RunResponse:
     """Request cooperative cancellation of an in-flight run."""
     with _runners_lock:
         runner = _runners.get(run_id)
-    if runner is None:
-        raise HTTPException(status_code=404, detail=f"run {run_id} is not executing")
-    runner.stop()
+    if runner is not None:
+        runner.stop()
+        return _run_response(SETTINGS, run_id)
+
+    # No live runner. If the row nonetheless says `running`, this process did not
+    # start it and never can stop it — so releasing the row here is the only way
+    # back. Without this the Stop button is a dead end on exactly the run the user
+    # is trying to escape from.
+    conn = db.connect(SETTINGS.database_path)
+    try:
+        record = db.get_run(conn, run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        if record["status"] != "running":
+            raise HTTPException(
+                status_code=404, detail=f"run {run_id} is not executing"
+            )
+        db.finish_run(
+            conn, run_id, status="stopped", error=ORPHAN_ERROR, finished_at=_now()
+        )
+    finally:
+        conn.close()
     return _run_response(SETTINGS, run_id)
 
 
@@ -383,6 +463,11 @@ def _stream_events(run_id: int) -> Iterator[str]:
 def _sse(event: str, payload: dict) -> str:
     """One Server-Sent Event frame."""
     return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+def _now() -> str:
+    """Current wall-clock time, ISO-8601 UTC, as the run rows store it."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _run_response(settings: Settings, run_id: int) -> RunResponse:

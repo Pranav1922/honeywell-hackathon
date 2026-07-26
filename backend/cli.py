@@ -146,7 +146,7 @@ def _execute(
     horizon_steps: int,
 ) -> RunSummary:
     """Create the run record, run the loop, and return its summary."""
-    simulator = build_simulator(scenario, args.simulator, horizon_steps)
+    simulator = build_simulator(scenario, args.simulator, horizon_steps, settings)
     controller = build_controller(args.controller, scenario, settings)
 
     conn = db.connect(settings.database_path)
