@@ -1,0 +1,28 @@
+{
+  "id": "winter_week",
+  "label": "Winter week, cold climate",
+  "start": "2024-01-15T00:00:00",
+  "days": 7,
+  "timestep_seconds": 900,
+  "weather": {
+    "provider": "synthetic",
+    "mean_temp_c": 4.0,
+    "daily_swing_c": 7.0,
+    "peak_solar_w_m2": 350.0
+  },
+  "occupied_hours": [8, 18],
+  "building": {
+    "initial_zone_temp_c": 18.0
+  },
+  "targets": {
+    "comfort_pmv_low": -0.5,
+    "comfort_pmv_high": 0.5,
+    "peak_demand_kw": 12.0,
+    "tariff_per_kwh": 0.18,
+    "grid_carbon_kg_per_kwh": 0.42
+  },
+  "energyplus": {
+    "idf": "baseline/small_office.idf",
+    "epw": "baseline/weather.epw"
+  }
+}
