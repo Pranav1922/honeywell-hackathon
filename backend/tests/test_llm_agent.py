@@ -834,6 +834,83 @@ def test_self_correction_is_bounded_and_then_falls_back():
     assert len(transport.requests) == 2  # the original attempt plus one repair
 
 
+def test_a_setback_that_tightens_the_band_is_refused_then_repaired():
+    """A declared ECM has to be present in the set-points, not just the label."""
+    supervisor, transport = build_supervisor(
+        [
+            # 'setback' with a band tighter than the occupied clamps: more plant
+            # runtime than holding, which is not a conservation measure at all.
+            reply("", policy_call(strategy="setback", heating_sp_c=19.0, cooling_sp_c=20.5)),
+            reply("", policy_call(strategy="setback", heating_sp_c=16.0, cooling_sp_c=28.0)),
+        ]
+    )
+
+    decision = supervisor.decide(build_state(step=96, occupancy=0.0), build_history(96))
+
+    assert decision.fallback_used is False
+    assert decision.policy.strategy == "setback"
+    assert decision.policy.cooling_sp_c == 28.0
+    assert decision.retries == 1
+    correction = transport.requests[1]["messages"][-1]["content"]
+    assert "must relax the set-points" in correction
+
+
+def test_unreviewed_simulator_diagnostics_are_read_before_a_policy_is_committed():
+    """The problem statement's 'extract runtime errors' path, end to end."""
+    supervisor, transport = build_supervisor(
+        [
+            reply("", policy_call()),                                  # commits blind
+            reply("", (("get_simulation_errors", "{}"),)),             # reads them
+            reply("", policy_call()),                                  # commits again
+        ]
+    )
+    supervisor._tools.context.record_error(
+        "   ** Severe  ** Zone air temperature is outside the reasonable range"
+    )
+
+    decision = supervisor.decide(build_state(step=96), build_history(96))
+
+    assert [call["name"] for call in decision.tool_calls] == [
+        "set_control_policy",
+        "get_simulation_errors",
+        "set_control_policy",
+    ]
+    assert decision.fallback_used is False
+    assert decision.retries == 0  # a diagnostics prompt is not a validation failure
+    assert "get_simulation_errors" in transport.requests[1]["messages"][-1]["content"]
+
+
+def test_diagnostics_are_requested_once_and_never_block_the_loop():
+    """A model that ignores the request still gets its policy adopted."""
+    supervisor, transport = build_supervisor([reply("", policy_call())] * 3)
+    supervisor._tools.context.record_error("   ** Warning ** something happened")
+
+    decision = supervisor.decide(build_state(step=96), build_history(96))
+
+    assert decision.fallback_used is False
+    assert decision.policy.strategy == "hold"
+    assert len(transport.requests) == 2  # asked once, then accepted
+
+
+def test_reviewed_diagnostics_are_not_requested_again():
+    """The same .err lines are read once per run, not once per control window."""
+    supervisor, _ = build_supervisor(
+        default=None,
+        script=[
+            reply("", (("get_simulation_errors", "{}"),)),
+            reply("", policy_call()),
+            reply("", policy_call()),
+        ],
+    )
+    supervisor._tools.context.record_error("   ** Warning ** something happened")
+
+    supervisor.decide(build_state(step=96), build_history(96))
+    second = supervisor.decide(build_state(step=100), build_history(100))
+
+    assert [call["name"] for call in second.tool_calls] == ["set_control_policy"]
+    assert second.fallback_used is False
+
+
 def test_malformed_tool_call_json_is_repaired_rather_than_fatal():
     """The most common real failure mode of a tool-calling model."""
     supervisor, transport = build_supervisor(

@@ -52,7 +52,10 @@ TOOLS: you may call get_recent_telemetry, get_comfort_limits, get_energy_summary
 evaluate_policy and get_simulation_errors to inspect the run, and evaluate_policy
 to score a candidate before committing to it. Call a tool only when the
 observation does not already answer the question — every call costs latency
-inside a live control loop.
+inside a live control loop. The one exception is mandatory: when the observation
+reports unreviewed simulator diagnostics, call get_simulation_errors and take
+what it returns into account before you call set_control_policy. Their content is
+never in the observation, so that call is the only way to see them.
 
 OUTPUT CONTRACT — this is absolute:
 - Finish by calling set_control_policy exactly once.
@@ -104,6 +107,7 @@ def build_observation(
         _limits_section(targets),
         _telemetry_section(history, targets),
         _previous_decisions_section(targets),
+        _diagnostics_section(targets),
         _objective_section(targets),
     ]
     return "\n\n".join(section for section in sections if section)
@@ -236,6 +240,27 @@ def _energy_section(targets: dict[str, Any]) -> str:
             f"(threshold {threshold_kw:.2f} kW, {headroom})",
             f"tariff              {tariff:9.3f} per kWh",
             f"grid carbon         {carbon:9.3f} kg CO2 per kWh",
+        ]
+    )
+
+
+def _diagnostics_section(targets: dict[str, Any]) -> str:
+    """Announce unreviewed simulator diagnostics, without inlining them.
+
+    Only the count appears here. The lines themselves stay behind
+    `get_simulation_errors` deliberately: the agent has to make the tool call to
+    read them, which is what turns "the engine reported something" into an
+    action the agent takes rather than a payload pushed into every prompt. A run
+    with nothing to report contributes no section at all.
+    """
+    pending = int(targets.get("unreviewed_diagnostics", 0) or 0)
+    if pending <= 0:
+        return ""
+    return "\n".join(
+        [
+            "== SIMULATOR DIAGNOSTICS ==",
+            f"{pending} unreviewed line(s) reported by the simulation engine.",
+            "Call get_simulation_errors to read them before committing a policy.",
         ]
     )
 
