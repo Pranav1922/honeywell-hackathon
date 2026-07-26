@@ -20,6 +20,7 @@ if __package__ in (None, ""):  # invoked as a script rather than a module
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app import db
+from app.agents.client import LLMConfigError
 from app.config import Scenario, Settings, list_scenarios, load_scenario, load_settings
 from app.energy import RunSummary, SavingsReport, compare
 from app.loop import (
@@ -115,7 +116,13 @@ def main() -> int:
         else scenario.horizon_steps
     )
 
-    summary = _execute(args, scenario, settings, horizon_steps)
+    try:
+        summary = _execute(args, scenario, settings, horizon_steps)
+    except LLMConfigError as exc:
+        # A missing API key is a setup problem, not a crash. Print the guidance,
+        # not a traceback that buries it.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     _print_summary(args, scenario, summary, horizon_steps)
 
     if args.compare is not None:
@@ -150,7 +157,7 @@ def _execute(
             controller=args.controller,
             simulator=args.simulator,
             scenario=scenario.id,
-            model=None,
+            model=settings.llm_model if args.controller == "llm" else None,
             baseline_run_id=args.compare,
             horizon_steps=horizon_steps,
             timestep_seconds=scenario.timestep_seconds,

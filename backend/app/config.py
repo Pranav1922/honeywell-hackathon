@@ -31,10 +31,10 @@ class Settings:
     database_path: Path = BACKEND_DIR / "ecoloop.db"
     scenarios_dir: Path = BACKEND_DIR / "config" / "scenarios"
 
-    # language model
-    llm_base_url: str = "http://localhost:11434/v1"
-    llm_model: str = "qwen2.5:7b-instruct"
-    llm_api_key: str = "ollama"
+    # language model — Groq-hosted open-source models
+    llm_base_url: str = "https://api.groq.com"
+    llm_model: str = "llama-3.3-70b-versatile"
+    llm_api_key: str = ""          # GROQ_API_KEY; never defaulted, never committed
     llm_timeout_seconds: float = 30.0
     llm_temperature: float = 0.2
 
@@ -142,9 +142,11 @@ def load_settings(env_file: Path | None = None) -> Settings:
     return Settings(
         database_path=_env_path("DATABASE_PATH", Settings.database_path),
         scenarios_dir=_env_path("SCENARIOS_DIR", Settings.scenarios_dir),
-        llm_base_url=_env_str("LLM_BASE_URL", Settings.llm_base_url),
-        llm_model=_env_str("LLM_MODEL", Settings.llm_model),
-        llm_api_key=_env_str("LLM_API_KEY", Settings.llm_api_key),
+        # GROQ_* are the documented names; the LLM_* names are still honoured so
+        # an existing .env keeps working. Neither has a committed default key.
+        llm_base_url=_env_str("GROQ_BASE_URL", _env_str("LLM_BASE_URL", Settings.llm_base_url)),
+        llm_model=_env_str("GROQ_MODEL", _env_str("LLM_MODEL", Settings.llm_model)),
+        llm_api_key=_env_str("GROQ_API_KEY", _env_str("LLM_API_KEY", Settings.llm_api_key)),
         llm_timeout_seconds=_env_float(
             "LLM_TIMEOUT_SECONDS", Settings.llm_timeout_seconds
         ),

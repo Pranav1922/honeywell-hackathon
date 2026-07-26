@@ -57,7 +57,10 @@ def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         energyplus_available=(SETTINGS.energyplus_dir / "pyenergyplus").is_dir(),
-        llm_available=_endpoint_reachable(SETTINGS.llm_base_url),
+        # A reachable endpoint with no credential cannot serve a run, so both
+        # conditions have to hold before the dashboard offers the LLM controller.
+        llm_available=bool(SETTINGS.llm_api_key)
+        and _endpoint_reachable(SETTINGS.llm_base_url),
         llm_model=SETTINGS.llm_model,
         database=str(SETTINGS.database_path),
     )
@@ -129,7 +132,7 @@ def start_run(request: StartRunRequest) -> RunResponse:
             controller=request.controller,
             simulator=request.simulator,
             scenario=scenario.id,
-            model=None,
+            model=settings.llm_model if request.controller == "llm" else None,
             baseline_run_id=request.baseline_run_id,
             horizon_steps=horizon_steps,
             timestep_seconds=scenario.timestep_seconds,
