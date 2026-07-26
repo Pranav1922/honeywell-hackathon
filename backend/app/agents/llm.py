@@ -32,7 +32,7 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
-from app.agents.base import ControlPolicy, Decision
+from app.agents.base import STRATEGY_SETBACK, ControlPolicy, Decision
 from app.agents.client import (
     LLMClient,
     LLMConfigError,
@@ -54,6 +54,7 @@ from app.utils.timeutil import is_cadence_due
 LOGGER = logging.getLogger("ecoloop.agent")
 
 POLICY_TOOL = "set_control_policy"
+ERROR_TOOL = "get_simulation_errors"
 POLICY_FIELDS = (
     "strategy",
     "heating_sp_c",
@@ -141,6 +142,7 @@ class LLMSupervisor:
 
         self._consecutive_failures = 0
         self._model_abandoned = False
+        self._errors_reviewed = 0
         self._previous: deque[dict[str, Any]] = deque(maxlen=PREVIOUS_DECISIONS_SHOWN)
         self.reasoning_log: deque[dict[str, Any]] = deque(maxlen=REASONING_LOG_ENTRIES)
 
@@ -204,6 +206,7 @@ class LLMSupervisor:
         self._tools.context.reset()
         self._consecutive_failures = 0
         self._model_abandoned = False
+        self._errors_reviewed = 0
         self._previous.clear()
         self.reasoning_log.clear()
 
@@ -238,6 +241,11 @@ class LLMSupervisor:
         completion_tokens = 0
         retries = 0
         last_response = ""
+        # Diagnostics the engine has reported but the model has not read. Asked
+        # for once per plan and never counted against `retries`: an unread .err
+        # must not be able to turn a workable policy into a fallback.
+        diagnostics_pending = self._unreviewed_diagnostics()
+        diagnostics_requested = False
 
         for iteration in range(1, self._max_tool_iterations + 1):
             result = self._client.chat(messages, tools=schemas)
@@ -258,6 +266,20 @@ class LLMSupervisor:
                 except ValueError as exc:
                     error = str(exc)
                 else:
+                    reviewed = any(call["name"] == ERROR_TOOL for call in calls)
+                    if diagnostics_pending and not reviewed and not diagnostics_requested:
+                        diagnostics_requested = True
+                        messages.append(
+                            build_correction(
+                                f"the simulation engine has reported "
+                                f"{diagnostics_pending} diagnostic line(s) you have "
+                                f"not read; call {ERROR_TOOL} and account for them "
+                                "before committing a policy"
+                            )
+                        )
+                        continue
+                    if reviewed:
+                        self._errors_reviewed = len(self._tools.context.error_log)
                     return _Plan(
                         policy=policy,
                         rationale=_clean_rationale(proposal.get("rationale")),
@@ -404,6 +426,23 @@ class LLMSupervisor:
                     f"{field} ({value:.2f}) is outside the safety envelope "
                     f"{floor_c:.1f}-{ceiling_c:.1f} C"
                 )
+        # An ECM has to be present in the numbers, not only in the label. A
+        # `setback` that leaves the band tighter than the occupied clamps runs
+        # the plant harder than holding would, which is the opposite of the
+        # measure it claims to be. Raised like any other validation failure, so
+        # the model is told and repairs it.
+        occupied_min_c = float(limits.get("min_zone_temp_c", 19.0))
+        occupied_max_c = float(limits.get("max_zone_temp_c", 26.0))
+        if strategy == STRATEGY_SETBACK and (
+            heating_sp_c > occupied_min_c or cooling_sp_c < occupied_max_c
+        ):
+            raise ValueError(
+                f"strategy 'setback' must relax the set-points at least to the "
+                f"occupied limits ({occupied_min_c:.1f}/{occupied_max_c:.1f} C), but "
+                f"you proposed {heating_sp_c:.1f}/{cooling_sp_c:.1f} C, which is "
+                "tighter and would use more energy than holding. Widen the band, or "
+                "pick the strategy that matches the set-points you want"
+            )
         if not 0.0 <= lighting_level <= 1.0:
             raise ValueError(
                 f"lighting_level ({lighting_level:.2f}) must be between 0.0 and 1.0"
@@ -526,7 +565,12 @@ class LLMSupervisor:
             "timestep_seconds": context.timestep_seconds,
             "history_window_steps": context.history_window_steps,
             "previous_decisions": list(self._previous),
+            "unreviewed_diagnostics": self._unreviewed_diagnostics(),
         }
+
+    def _unreviewed_diagnostics(self) -> int:
+        """Simulator diagnostic lines the model has not fetched yet this run."""
+        return max(0, len(self._tools.context.error_log) - self._errors_reviewed)
 
     def _remember(self, state: BuildingState, plan: _Plan) -> None:
         """Keep a short trail of decisions so the next window stays consistent."""
